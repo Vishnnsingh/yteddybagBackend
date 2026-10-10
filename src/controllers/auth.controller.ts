@@ -8,11 +8,51 @@ import AppError from '../utils/AppError';
 import { OAuth2Client } from 'google-auth-library';
 import env from '../config/env';
 
-const googleClient = new OAuth2Client(
-  env.GOOGLE_CLIENT_ID,
-  env.GOOGLE_CLIENT_SECRET,
-  'http://localhost:5000/api/v1/auth/google/callback'
-);
+// Dynamic Google OAuth client & URL helpers
+function getGoogleRedirectUri(req: Request): string {
+  if (env.GOOGLE_CALLBACK_URL) {
+    return env.GOOGLE_CALLBACK_URL;
+  }
+  if (process.env.RENDER_EXTERNAL_URL) {
+    return `${process.env.RENDER_EXTERNAL_URL}/api/v1/auth/google/callback`;
+  }
+  const forwardedProto = req.get('x-forwarded-proto');
+  const isHttps = req.secure || forwardedProto === 'https' || (req.get('host') || '').includes('onrender.com');
+  const protocol = isHttps ? 'https' : 'http';
+  const host = req.get('x-forwarded-host') || req.get('host') || 'localhost:5000';
+  return `${protocol}://${host}/api/v1/auth/google/callback`;
+}
+
+function getGoogleOAuthClient(redirectUri: string): OAuth2Client {
+  return new OAuth2Client(
+    env.GOOGLE_CLIENT_ID,
+    env.GOOGLE_CLIENT_SECRET,
+    redirectUri
+  );
+}
+
+function getFrontendBaseUrl(req: Request, passedOrigin?: string): string {
+  if (passedOrigin && !passedOrigin.includes('localhost:5000') && !passedOrigin.includes('onrender.com')) {
+    return passedOrigin.replace(/\/+$/, '');
+  }
+  if (env.FRONTEND_URL) {
+    return env.FRONTEND_URL.replace(/\/+$/, '');
+  }
+  const origin = req.get('origin');
+  if (origin && !origin.includes('5000') && !origin.includes('onrender.com')) {
+    return origin.replace(/\/+$/, '');
+  }
+  const referer = req.get('referer');
+  if (referer) {
+    try {
+      const u = new URL(referer);
+      if (!u.host.includes('5000') && !u.host.includes('onrender.com')) {
+        return u.origin.replace(/\/+$/, '');
+      }
+    } catch {}
+  }
+  return env.corsOrigins[0] || 'http://localhost:5173';
+}
 
 // Helper to ensure user is registered in Supabase's native auth.users table (visible in Supabase Authentication Dashboard)
 async function ensureSupabaseAuthUser(supabase: any, email: string, name: string, role: string, password?: string) {
@@ -82,28 +122,55 @@ export const loginWithEmail = async (req: Request, res: Response, next: any) => 
 
 export const getGoogleAuthUrl = (req: Request, res: Response) => {
   const from = req.query.from === 'admin' ? 'admin' : 'user';
-  const url = googleClient.generateAuthUrl({
+  const redirectUri = getGoogleRedirectUri(req);
+  const client = getGoogleOAuthClient(redirectUri);
+
+  const queryOrigin = typeof req.query.origin === 'string' ? req.query.origin : undefined;
+  const frontendBase = getFrontendBaseUrl(req, queryOrigin);
+
+  const statePayload = Buffer.from(
+    JSON.stringify({ from, frontend: frontendBase })
+  ).toString('base64url');
+
+  const url = client.generateAuthUrl({
     access_type: 'offline',
     scope: ['email', 'profile'],
-    state: from,
+    state: statePayload,
+    prompt: 'select_account',
   });
   return successResponse(res, 'Generated Google Auth URL', { url });
 };
 
 export const googleCallback = async (req: Request, res: Response) => {
   const { code, state } = req.query;
-  const isAdminFlow = state === 'admin';
+
+  let isAdminFlow = false;
+  let frontendBase = getFrontendBaseUrl(req);
+
+  if (state && typeof state === 'string') {
+    try {
+      const decodedStr = Buffer.from(state, 'base64url').toString('utf8');
+      const parsed = JSON.parse(decodedStr);
+      if (parsed.from === 'admin') isAdminFlow = true;
+      if (parsed.frontend) frontendBase = parsed.frontend.replace(/\/+$/, '');
+    } catch {
+      isAdminFlow = state === 'admin';
+    }
+  }
+
+  const redirectUri = getGoogleRedirectUri(req);
+  const client = getGoogleOAuthClient(redirectUri);
 
   try {
     if (!code || typeof code !== 'string') {
       const redirectUrl = isAdminFlow
-        ? 'http://localhost:5173/dashboard/login?error=InvalidGoogleCode'
-        : 'http://localhost:5173/login?error=InvalidGoogleCode';
+        ? `${frontendBase}/dashboard/login?error=InvalidGoogleCode`
+        : `${frontendBase}/login?error=InvalidGoogleCode`;
       return res.redirect(redirectUrl);
     }
 
-    const { tokens } = await googleClient.getToken(code);
-    const ticket = await googleClient.verifyIdToken({
+    const { tokens } = await client.getToken(code);
+    const ticket = await client.verifyIdToken({
       idToken: tokens.id_token!,
       audience: env.GOOGLE_CLIENT_ID,
     });
@@ -135,7 +202,7 @@ export const googleCallback = async (req: Request, res: Response) => {
 
         if (insertError) {
           console.error('Error creating admin from Google:', insertError);
-          return res.redirect('http://localhost:5173/dashboard/login?error=AdminCreationFailed');
+          return res.redirect(`${frontendBase}/dashboard/login?error=AdminCreationFailed`);
         }
         admin = newAdmin;
       }
@@ -146,7 +213,7 @@ export const googleCallback = async (req: Request, res: Response) => {
       const { accessToken, refreshToken } = generateAccessAndRefreshTokens(admin.id, 'admin');
       setAuthCookie(res, refreshToken);
 
-      return res.redirect(`http://localhost:5173/dashboard?adminToken=${accessToken}&adminRefreshToken=${refreshToken}`);
+      return res.redirect(`${frontendBase}/dashboard?adminToken=${accessToken}&adminRefreshToken=${refreshToken}`);
     } else {
       // 2. Customer login via Google
       let { data: user, error } = await supabase
@@ -180,13 +247,13 @@ export const googleCallback = async (req: Request, res: Response) => {
       const { accessToken, refreshToken } = generateAccessAndRefreshTokens(user.id, user.role);
       setAuthCookie(res, refreshToken);
 
-      return res.redirect(`http://localhost:5173/?token=${accessToken}&refreshToken=${refreshToken}`);
+      return res.redirect(`${frontendBase}/?token=${accessToken}&refreshToken=${refreshToken}`);
     }
   } catch (err) {
     console.error(err);
     const redirectUrl = isAdminFlow
-      ? 'http://localhost:5173/dashboard/login?error=GoogleCallbackFailed'
-      : 'http://localhost:5173/login?error=GoogleCallbackFailed';
+      ? `${frontendBase}/dashboard/login?error=GoogleCallbackFailed`
+      : `${frontendBase}/login?error=GoogleCallbackFailed`;
     return res.redirect(redirectUrl);
   }
 };
