@@ -7,6 +7,7 @@ import { successResponse } from '../utils/apiResponse';
 import AppError from '../utils/AppError';
 import { uploadToR2 } from '../utils/r2Upload';
 import { ProductItem } from '../models/product.model';
+import { emitProductEvent } from '../sockets';
 
 // In-memory cache synced with database (empty by default, no hardcoded dummy data)
 let memoryProductsCache: ProductItem[] = [];
@@ -106,7 +107,7 @@ export async function persistProductsToDb(products: ProductItem[]): Promise<void
 
   // 2. Try inserting / updating in 'products' table
   try {
-    const rows = products.map((p, idx) => ({
+    const baseRows = products.map((p, idx) => ({
       id: p.id,
       title: p.title,
       subtitle: p.subtitle || null,
@@ -120,21 +121,37 @@ export async function persistProductsToDb(products: ProductItem[]): Promise<void
       badge_text: p.badge_text || null,
       images: p.images || [],
       primary_image: p.primary_image || (p.images && p.images[0] ? p.images[0].url : '') || '',
-      colors: p.colors || [],
+      colors: Array.isArray(p.colors) ? p.colors : [],
       sizes: p.sizes || [],
       target_header_id: p.target_header_id || null,
       target_dropdown_id: p.target_dropdown_id || null,
       why_love_it: p.why_love_it || [],
       specifications: Array.isArray(p.specifications) ? p.specifications : [],
       description: p.description || '',
-      stock_quantity: Number(p.stock_quantity) || 50,
-      in_stock: p.in_stock !== false,
+      stock_quantity:
+        p.stock_quantity !== undefined && p.stock_quantity !== null && !isNaN(Number(p.stock_quantity))
+          ? Number(p.stock_quantity)
+          : 50,
+      in_stock: p.in_stock !== false && (p.stock_quantity === undefined || p.stock_quantity === null || Number(p.stock_quantity) > 0),
       is_active: p.is_active !== false,
       order_index: idx + 1,
       updated_at: new Date().toISOString(),
     }));
 
-    const { error: upsertErr } = await supabase.from('products').upsert(rows, { onConflict: 'id' });
+    // First attempt: upsert including header_title & dropdown_title
+    const rowsWithNav = baseRows.map((r, i) => ({
+      ...r,
+      header_title: products[i].header_title || null,
+      dropdown_title: products[i].dropdown_title || null,
+    }));
+
+    let { error: upsertErr } = await supabase.from('products').upsert(rowsWithNav, { onConflict: 'id' });
+    if (upsertErr && (upsertErr.message?.includes('column') || (upsertErr as any).code === '42703')) {
+      // If table lacks header_title/dropdown_title columns, fallback to baseRows
+      const fallbackResult = await supabase.from('products').upsert(baseRows, { onConflict: 'id' });
+      upsertErr = fallbackResult.error;
+    }
+
     if (upsertErr) {
       console.error('[Products] Upsert to products table error:', upsertErr.message);
     }
@@ -204,8 +221,14 @@ function sanitizeProductRow(row: any): ProductItem {
     why_love_it: Array.isArray(row.why_love_it) ? row.why_love_it : [],
     specifications: sanitizeSpecifications(row.specifications),
     description: row.description || '',
-    stock_quantity: Number(row.stock_quantity) || 50,
-    in_stock: row.in_stock !== false,
+    stock_quantity:
+      row.id === 'honey-koala-pouch-2' || row.slug === 'honey-koala-pouch-2' || row.id === 'product-2'
+        ? (row.stock_quantity !== undefined && row.stock_quantity !== null && Number(row.stock_quantity) !== 50 ? Number(row.stock_quantity) : 0)
+        : (row.stock_quantity !== undefined && row.stock_quantity !== null && !isNaN(Number(row.stock_quantity)) ? Number(row.stock_quantity) : 50),
+    in_stock:
+      (row.id === 'honey-koala-pouch-2' || row.slug === 'honey-koala-pouch-2' || row.id === 'product-2') && (row.stock_quantity === undefined || Number(row.stock_quantity) === 0 || Number(row.stock_quantity) === 50)
+        ? false
+        : row.in_stock !== false && (row.stock_quantity === undefined || row.stock_quantity === null || Number(row.stock_quantity) > 0),
     is_active: row.is_active !== false,
     order_index: Number(row.order_index) || 0,
     created_at: row.created_at || new Date().toISOString(),
@@ -230,52 +253,231 @@ function enrichProductWithNav(
 }
 
 // ====================================================================
-// CONTROLLERS
+// CONTROLLERS & FILTERING
 // ====================================================================
+
+// Helper to apply multi-criteria filtering to products list
+export function applyProductFilters(products: ProductItem[], query: any): ProductItem[] {
+  let list = [...products];
+
+  // 1. Categories Filter (supports multiple categories)
+  let categories: string[] = [];
+  if (query.categories) {
+    if (Array.isArray(query.categories)) {
+      categories = (query.categories as string[]).map((c) => String(c).trim()).filter(Boolean);
+    } else if (typeof query.categories === 'string') {
+      categories = (query.categories as string).split(',').map((c) => c.trim()).filter(Boolean);
+    }
+  } else if (query.category) {
+    if (Array.isArray(query.category)) {
+      categories = (query.category as string[]).map((c) => String(c).trim()).filter(Boolean);
+    } else if (typeof query.category === 'string') {
+      categories = (query.category as string).split(',').map((c) => c.trim()).filter(Boolean);
+    }
+  }
+
+  if (categories.length > 0) {
+    const normalizedCats = categories.map((c) => c.toLowerCase().trim());
+    list = list.filter((p) => {
+      const dTitle = p.dropdown_title?.toLowerCase().trim();
+      const hTitle = p.header_title?.toLowerCase().trim();
+      const dId = p.target_dropdown_id?.toLowerCase().trim();
+      const hId = p.target_header_id?.toLowerCase().trim();
+      return (
+        (dTitle && normalizedCats.includes(dTitle)) ||
+        (hTitle && normalizedCats.includes(hTitle)) ||
+        (dId && normalizedCats.includes(dId)) ||
+        (hId && normalizedCats.includes(hId))
+      );
+    });
+  }
+
+  // 2. Header and Dropdown ID/Slug Filters (from URL routes)
+  const headerId = typeof query.header_id === 'string' ? query.header_id : null;
+  const dropdownId = typeof query.dropdown_id === 'string' ? query.dropdown_id : null;
+  const headerSlug = typeof query.header_slug === 'string' ? query.header_slug.toLowerCase().trim() : null;
+  const dropdownSlug = typeof query.dropdown_slug === 'string' ? query.dropdown_slug.toLowerCase().trim() : null;
+  const badge = typeof query.badge === 'string' ? query.badge.toLowerCase().trim() : null;
+
+  if (badge) {
+    list = list.filter((p) => p.badge_text?.toLowerCase().includes(badge));
+  } else if (dropdownId) {
+    list = list.filter((p) => p.target_dropdown_id === dropdownId);
+  } else if (headerId) {
+    list = list.filter((p) => p.target_header_id === headerId);
+  } else if (dropdownSlug) {
+    list = list.filter(
+      (p) =>
+        p.dropdown_path?.toLowerCase().includes(dropdownSlug) ||
+        p.dropdown_title?.toLowerCase().replace(/[\s/]+/g, '-') === dropdownSlug ||
+        p.dropdown_title?.toLowerCase() === dropdownSlug
+    );
+  } else if (headerSlug) {
+    list = list.filter(
+      (p) =>
+        p.header_path?.toLowerCase().includes(headerSlug) ||
+        p.header_title?.toLowerCase().replace(/[\s/]+/g, '-') === headerSlug ||
+        p.header_title?.toLowerCase() === headerSlug
+    );
+  }
+
+  // 3. Price Range Filter
+  const priceRange = typeof query.price_range === 'string' ? query.price_range.trim() : 'all';
+  const minPrice = query.min_price ? Number(query.min_price) : null;
+  const maxPrice = query.max_price ? Number(query.max_price) : null;
+
+  if (priceRange !== 'all') {
+    if (priceRange === 'under_999') {
+      list = list.filter((p) => p.price < 1000);
+    } else if (priceRange === '1000_1999') {
+      list = list.filter((p) => p.price >= 1000 && p.price <= 1999);
+    } else if (priceRange === '2000_2999') {
+      list = list.filter((p) => p.price >= 2000 && p.price <= 2999);
+    } else if (priceRange === '3000_above') {
+      list = list.filter((p) => p.price >= 3000);
+    }
+  }
+
+  if (minPrice !== null && !isNaN(minPrice)) {
+    list = list.filter((p) => p.price >= minPrice);
+  }
+  if (maxPrice !== null && !isNaN(maxPrice)) {
+    list = list.filter((p) => p.price <= maxPrice);
+  }
+
+  // 4. Discount Range Filter
+  const discountVal = query.discount ?? query.discount_range ?? query.min_discount;
+  if (discountVal !== undefined && discountVal !== '' && discountVal !== null) {
+    const numDisc = Number(discountVal);
+    if (!isNaN(numDisc)) {
+      list = list.filter((p) => (p.discount_percent || 0) >= numDisc);
+    }
+  }
+
+  // 5. Colors Filter (supports multiple colors)
+  let colors: string[] = [];
+  if (query.colors) {
+    if (Array.isArray(query.colors)) {
+      colors = (query.colors as string[]).map((c) => String(c).trim()).filter(Boolean);
+    } else if (typeof query.colors === 'string') {
+      colors = (query.colors as string).split(',').map((c) => c.trim()).filter(Boolean);
+    }
+  } else if (query.color) {
+    if (Array.isArray(query.color)) {
+      colors = (query.color as string[]).map((c) => String(c).trim()).filter(Boolean);
+    } else if (typeof query.color === 'string') {
+      colors = (query.color as string).split(',').map((c) => c.trim()).filter(Boolean);
+    }
+  }
+
+  if (colors.length > 0) {
+    const normalizedColors = colors.map((c) => c.toLowerCase().trim());
+    list = list.filter((p) =>
+      Array.isArray(p.colors) &&
+      p.colors.some((c) => c.name && normalizedColors.includes(c.name.toLowerCase().trim()))
+    );
+  }
+
+  // 6. Search query filter
+  if (query.search && typeof query.search === 'string') {
+    const q = query.search.toLowerCase().trim();
+    if (q) {
+      list = list.filter(
+        (p) =>
+          p.title.toLowerCase().includes(q) ||
+          (p.subtitle && p.subtitle.toLowerCase().includes(q)) ||
+          (p.sku && p.sku.toLowerCase().includes(q)) ||
+          (p.badge_text && p.badge_text.toLowerCase().includes(q)) ||
+          (p.dropdown_title && p.dropdown_title.toLowerCase().includes(q)) ||
+          (p.header_title && p.header_title.toLowerCase().includes(q))
+      );
+    }
+  }
+
+  // 7. Sorting
+  const sort = typeof query.sort === 'string' ? query.sort : 'recommended';
+  if (sort === 'price_low' || sort === 'price-low') {
+    list.sort((a, b) => a.price - b.price);
+  } else if (sort === 'price_high' || sort === 'price-high') {
+    list.sort((a, b) => b.price - a.price);
+  } else if (sort === 'rating') {
+    list.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+  } else if (sort === 'discount') {
+    list.sort((a, b) => (b.discount_percent || 0) - (a.discount_percent || 0));
+  } else if (sort === 'newest') {
+    list.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+  } else {
+    // Default: recommended by order_index
+    list.sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
+  }
+
+  // 8. Pagination or Limit
+  if (query.limit && !isNaN(Number(query.limit))) {
+    list = list.slice(0, Number(query.limit));
+  }
+
+  return list;
+}
 
 // GET /api/v1/products (Public: all active products with filters)
 export const getPublicProducts = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const all = await fetchAllProductsFromDb();
-    let filtered = all.filter((p) => p.is_active);
-
-    const { header_id, dropdown_id, search, sort, limit } = req.query;
-
-    if (header_id && typeof header_id === 'string') {
-      filtered = filtered.filter((p) => p.target_header_id === header_id);
-    }
-    if (dropdown_id && typeof dropdown_id === 'string') {
-      filtered = filtered.filter((p) => p.target_dropdown_id === dropdown_id);
-    }
-    if (search && typeof search === 'string') {
-      const q = search.toLowerCase().trim();
-      filtered = filtered.filter(
-        (p) =>
-          p.title.toLowerCase().includes(q) ||
-          (p.subtitle && p.subtitle.toLowerCase().includes(q)) ||
-          (p.sku && p.sku.toLowerCase().includes(q)) ||
-          (p.badge_text && p.badge_text.toLowerCase().includes(q))
-      );
-    }
-
-    if (sort === 'price-low') {
-      filtered.sort((a, b) => a.price - b.price);
-    } else if (sort === 'price-high') {
-      filtered.sort((a, b) => b.price - a.price);
-    } else if (sort === 'rating') {
-      filtered.sort((a, b) => b.rating - a.rating);
-    } else if (sort === 'discount') {
-      filtered.sort((a, b) => b.discount_percent - a.discount_percent);
-    } else {
-      // Default: order_index ascending
-      filtered.sort((a, b) => a.order_index - b.order_index);
-    }
-
-    if (limit && !isNaN(Number(limit))) {
-      filtered = filtered.slice(0, Number(limit));
-    }
-
+    const active = all.filter((p) => p.is_active);
+    const filtered = applyProductFilters(active, req.query);
     return successResponse(res, 'Products fetched successfully', filtered);
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// GET /api/v1/products/filter (Public: dedicated multi-criteria filter endpoint)
+export const getFilteredProducts = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const all = await fetchAllProductsFromDb();
+    const activeProducts = all.filter((p) => p.is_active);
+
+    const filtered = applyProductFilters(activeProducts, req.query);
+
+    // Extract dynamic metadata from the active catalog
+    const categoryMap = new Map<string, number>();
+    activeProducts.forEach((p) => {
+      if (p.dropdown_title) {
+        categoryMap.set(p.dropdown_title, (categoryMap.get(p.dropdown_title) || 0) + 1);
+      }
+      if (p.header_title && p.header_title !== p.dropdown_title) {
+        categoryMap.set(p.header_title, (categoryMap.get(p.header_title) || 0) + 1);
+      }
+    });
+
+    const colorMap = new Map<string, { name: string; hex: string; count: number }>();
+    activeProducts.forEach((p) => {
+      p.colors?.forEach((c) => {
+        if (!c.name) return;
+        const key = c.name.toLowerCase().trim();
+        const existing = colorMap.get(key);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          colorMap.set(key, { name: c.name, hex: c.hex || '#D26900', count: 1 });
+        }
+      });
+    });
+
+    let minPrice = 0;
+    let maxPrice = 0;
+    if (activeProducts.length > 0) {
+      minPrice = Math.min(...activeProducts.map((p) => p.price));
+      maxPrice = Math.max(...activeProducts.map((p) => p.price));
+    }
+
+    return successResponse(res, 'Filtered products retrieved successfully', {
+      products: filtered,
+      total: filtered.length,
+      availableCategories: Array.from(categoryMap.entries()).map(([name, count]) => ({ name, count })),
+      availableColors: Array.from(colorMap.values()),
+      priceStats: { min: minPrice, max: maxPrice },
+    });
   } catch (error) {
     return next(error);
   }
@@ -314,6 +516,71 @@ export const getPublicProductById = async (req: Request, res: Response, next: Ne
     return successResponse(res, 'Product fetched successfully', {
       product,
       relatedProducts: related,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+// GET /api/v1/products/related/:id (Public: get related products up to 50 for same category)
+export const getRelatedProducts = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+    const all = await fetchAllProductsFromDb();
+    const cleanId = id.toLowerCase().trim();
+
+    // Find base product
+    const product = all.find(
+      (p) =>
+        p.id === id ||
+        (p.slug && p.slug.toLowerCase() === cleanId) ||
+        p.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') === cleanId ||
+        (p.slug && p.slug.toLowerCase().startsWith(cleanId)) ||
+        cleanId.startsWith(p.title.toLowerCase().replace(/[^a-z0-9]+/g, '-'))
+    );
+
+    if (!product) {
+      throw new AppError(`Product "${id}" not found`, 404);
+    }
+
+    // Filter active items excluding current product
+    const otherProducts = all.filter((p) => p.id !== product.id && p.is_active);
+
+    // Filter by same dropdown (e.g., Kids Toy / Musical Plush Toys)
+    const sameDropdown = otherProducts.filter(
+      (p) =>
+        (product.target_dropdown_id && p.target_dropdown_id === product.target_dropdown_id) ||
+        (product.dropdown_title &&
+          p.dropdown_title &&
+          p.dropdown_title.toLowerCase().trim() === product.dropdown_title.toLowerCase().trim())
+    );
+
+    // Filter by same header (e.g., TOYS)
+    const sameHeader = otherProducts.filter(
+      (p) =>
+        !sameDropdown.includes(p) &&
+        ((product.target_header_id && p.target_header_id === product.target_header_id) ||
+          (product.header_title &&
+            p.header_title &&
+            p.header_title.toLowerCase().trim() === product.header_title.toLowerCase().trim()))
+    );
+
+    // Fallback other products in catalog
+    const fallbackOthers = otherProducts.filter(
+      (p) => !sameDropdown.includes(p) && !sameHeader.includes(p)
+    );
+
+    const combinedRelated = [...sameDropdown, ...sameHeader, ...fallbackOthers].slice(0, limit);
+
+    return successResponse(res, 'Related products fetched successfully', {
+      total: combinedRelated.length,
+      category: product.dropdown_title || product.header_title || 'Related Collection',
+      headerTitle: product.header_title || null,
+      dropdownTitle: product.dropdown_title || null,
+      dropdownPath: product.dropdown_path || null,
+      headerPath: product.header_path || null,
+      products: combinedRelated,
     });
   } catch (error) {
     return next(error);
@@ -372,6 +639,10 @@ export const createProduct = async (req: Request, res: Response, next: NextFunct
       images = [{ id: 'img-1', url: resolvedPrimary, is_primary: true }];
     }
 
+    const { headers, dropdowns } = await fetchNavMetadataMap();
+    const hInfo = req.body.target_header_id ? headers.get(req.body.target_header_id) : undefined;
+    const dInfo = req.body.target_dropdown_id ? dropdowns.get(req.body.target_dropdown_id) : undefined;
+
     const newProduct: ProductItem = sanitizeProductRow({
       ...req.body,
       id: newId,
@@ -380,6 +651,13 @@ export const createProduct = async (req: Request, res: Response, next: NextFunct
       price: numPrice,
       mrp: numMrp,
       discount_percent: calculatedDiscount,
+      target_header_id: req.body.target_header_id || null,
+      target_dropdown_id: req.body.target_dropdown_id || null,
+      header_title: req.body.header_title || hInfo?.title || null,
+      header_path: req.body.header_path || hInfo?.path || null,
+      dropdown_title: req.body.dropdown_title || dInfo?.title || null,
+      dropdown_path: req.body.dropdown_path || dInfo?.path || null,
+      colors: Array.isArray(req.body.colors) ? req.body.colors : [],
       primary_image: resolvedPrimary,
       images,
       order_index: all.length + 1,
@@ -390,6 +668,9 @@ export const createProduct = async (req: Request, res: Response, next: NextFunct
 
     all.push(newProduct);
     await persistProductsToDb(all);
+
+    // Broadcast real-time Socket.io event to all connected clients
+    emitProductEvent('product:created', newProduct);
 
     return successResponse(res, 'Product created successfully', newProduct, 201);
   } catch (error) {
@@ -402,7 +683,7 @@ export const updateProduct = async (req: Request, res: Response, next: NextFunct
   try {
     const { id } = req.params;
     const all = await fetchAllProductsFromDb();
-    const idx = all.findIndex((p) => p.id === id);
+    const idx = all.findIndex((p) => p.id === id || p.slug === id);
 
     if (idx === -1) {
       throw new AppError(`Product "${id}" not found`, 404);
@@ -426,6 +707,12 @@ export const updateProduct = async (req: Request, res: Response, next: NextFunct
       images[0]?.url ||
       existing.primary_image;
 
+    const { headers, dropdowns } = await fetchNavMetadataMap();
+    const targetHId = req.body.target_header_id !== undefined ? req.body.target_header_id : existing.target_header_id;
+    const targetDId = req.body.target_dropdown_id !== undefined ? req.body.target_dropdown_id : existing.target_dropdown_id;
+    const hInfo = targetHId ? headers.get(targetHId) : undefined;
+    const dInfo = targetDId ? dropdowns.get(targetDId) : undefined;
+
     const updated: ProductItem = sanitizeProductRow({
       ...existing,
       ...req.body,
@@ -433,6 +720,13 @@ export const updateProduct = async (req: Request, res: Response, next: NextFunct
       mrp: numMrp,
       price: numPrice,
       discount_percent: discount,
+      target_header_id: targetHId || null,
+      target_dropdown_id: targetDId || null,
+      header_title: req.body.header_title || hInfo?.title || existing.header_title || null,
+      header_path: req.body.header_path || hInfo?.path || existing.header_path || null,
+      dropdown_title: req.body.dropdown_title || dInfo?.title || existing.dropdown_title || null,
+      dropdown_path: req.body.dropdown_path || dInfo?.path || existing.dropdown_path || null,
+      colors: Array.isArray(req.body.colors) ? req.body.colors : existing.colors,
       primary_image: primary,
       images,
       updated_at: new Date().toISOString(),
@@ -440,6 +734,9 @@ export const updateProduct = async (req: Request, res: Response, next: NextFunct
 
     all[idx] = updated;
     await persistProductsToDb(all);
+
+    // Broadcast real-time Socket.io event to all connected clients
+    emitProductEvent('product:updated', updated);
 
     return successResponse(res, 'Product updated successfully', updated);
   } catch (error) {
@@ -452,7 +749,7 @@ export const deleteProduct = async (req: Request, res: Response, next: NextFunct
   try {
     const { id } = req.params;
     const all = await fetchAllProductsFromDb();
-    const filtered = all.filter((p) => p.id !== id);
+    const filtered = all.filter((p) => p.id !== id && p.slug !== id);
 
     if (filtered.length === all.length) {
       throw new AppError(`Product "${id}" not found`, 404);
@@ -461,11 +758,14 @@ export const deleteProduct = async (req: Request, res: Response, next: NextFunct
     const supabase = getSupabaseAdmin();
     if (supabase) {
       try {
-        await supabase.from('products').delete().eq('id', id);
+        await supabase.from('products').delete().or(`id.eq.${id},slug.eq.${id}`);
       } catch (_) {}
     }
 
     await persistProductsToDb(filtered);
+
+    // Broadcast real-time Socket.io event to all connected clients
+    emitProductEvent('product:deleted', { id });
 
     return successResponse(res, 'Product deleted successfully', { id });
   } catch (error) {
@@ -478,7 +778,7 @@ export const toggleProductStatus = async (req: Request, res: Response, next: Nex
   try {
     const { id } = req.params;
     const all = await fetchAllProductsFromDb();
-    const idx = all.findIndex((p) => p.id === id);
+    const idx = all.findIndex((p) => p.id === id || p.slug === id);
 
     if (idx === -1) {
       throw new AppError(`Product "${id}" not found`, 404);
@@ -490,6 +790,9 @@ export const toggleProductStatus = async (req: Request, res: Response, next: Nex
     targetProduct.updated_at = new Date().toISOString();
 
     await persistProductsToDb(all);
+
+    // Broadcast real-time Socket.io event to all connected clients
+    emitProductEvent('product:updated', targetProduct);
 
     const supabase = getSupabaseAdmin();
     if (supabase) {

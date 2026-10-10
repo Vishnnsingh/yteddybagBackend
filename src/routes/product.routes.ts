@@ -2,7 +2,9 @@ import { Router } from 'express';
 import mediaUpload from '../middleware/mediaUpload';
 import {
   getPublicProducts,
+  getFilteredProducts,
   getPublicProductById,
+  getRelatedProducts,
   getAdminProducts,
   createProduct,
   updateProduct,
@@ -20,8 +22,14 @@ const router = Router();
 // GET /api/v1/products - List products with filter, search, sorting & pagination
 router.get('/', getPublicProducts);
 
+// GET /api/v1/products/filter - Multi-criteria product filter endpoint (categories, price, discount, color)
+router.get('/filter', getFilteredProducts);
+
 // GET /api/v1/products/detail/:id - Get single product detail by UUID or slug (includes related products)
 router.get('/detail/:id', getPublicProductById);
+
+// GET /api/v1/products/related/:id - Dedicated related products endpoint for More You'll Adore (up to 50 items)
+router.get('/related/:id', getRelatedProducts);
 
 // ==========================================
 // ADMIN PRODUCT MANAGEMENT ROUTES

@@ -56,3 +56,9 @@ GRANT ALL PRIVILEGES ON public.products TO postgres, anon, authenticated, servic
 
 -- If table was previously created with delivery_info column, safely drop it:
 ALTER TABLE public.products DROP COLUMN IF EXISTS delivery_info;
+
+-- Ensure categories metadata & price/discount indexes exist for filtering
+ALTER TABLE public.products ADD COLUMN IF NOT EXISTS header_title VARCHAR(255) DEFAULT NULL;
+ALTER TABLE public.products ADD COLUMN IF NOT EXISTS dropdown_title VARCHAR(255) DEFAULT NULL;
+CREATE INDEX IF NOT EXISTS products_price_idx ON public.products (price);
+CREATE INDEX IF NOT EXISTS products_discount_idx ON public.products (discount_percent);

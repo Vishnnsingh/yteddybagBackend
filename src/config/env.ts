@@ -49,9 +49,16 @@ const env = {
 
   isDev: NODE_ENV === 'development',
   isProd: NODE_ENV === 'production',
-  corsOrigins: CORS_ORIGIN.split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean),
+  corsOrigins: Array.from(
+    new Set([
+      'http://localhost:5173',
+      'http://localhost:3000',
+      'https://yteddybag-frontend.vercel.app',
+      ...CORS_ORIGIN.split(',')
+        .map((origin) => origin.trim())
+        .filter(Boolean),
+    ])
+  ),
 };
 
 export type Env = typeof env;

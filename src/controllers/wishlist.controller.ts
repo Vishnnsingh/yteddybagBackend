@@ -4,6 +4,7 @@ import { successResponse } from '../utils/apiResponse';
 import AppError from '../utils/AppError';
 import { fetchAllProductsFromDb } from './product.controller';
 import { ProductItem } from '../models/product.model';
+import { emitWishlistEvent } from '../sockets';
 
 // In-memory fallback if Supabase table is not yet migrated
 interface WishlistRecord {
@@ -135,6 +136,11 @@ export const toggleWishlistItem = async (req: Request, res: Response, next: Next
           )
       );
 
+      // Real-time multi-device sync notification
+      if (userId) {
+        emitWishlistEvent('wishlist:updated', { userId, productId, inWishlist: false });
+      }
+
       return successResponse(res, 'Product removed from wishlist', {
         inWishlist: false,
         productId,
@@ -159,6 +165,11 @@ export const toggleWishlistItem = async (req: Request, res: Response, next: Next
         productId,
         createdAt: new Date().toISOString(),
       });
+
+      // Real-time multi-device sync notification
+      if (userId) {
+        emitWishlistEvent('wishlist:updated', { userId, productId, inWishlist: true, product });
+      }
 
       return successResponse(res, 'Product added to wishlist', {
         inWishlist: true,
@@ -197,6 +208,11 @@ export const removeWishlistItem = async (req: Request, res: Response, next: Next
           ((userId && w.userId === userId) || (guestId && w.guestId === guestId))
         )
     );
+
+    // Real-time multi-device sync notification
+    if (userId) {
+      emitWishlistEvent('wishlist:updated', { userId, productId, inWishlist: false });
+    }
 
     return successResponse(res, 'Product removed from wishlist', { productId });
   } catch (error) {
@@ -237,6 +253,9 @@ export const syncWishlistOnLogin = async (req: Request, res: Response, next: Nex
         }
       }
     }
+
+    // Real-time multi-device sync notification
+    emitWishlistEvent('wishlist:synced', { userId });
 
     // Return the full updated wishlist
     return getWishlist(req, res, next);
