@@ -10,6 +10,8 @@ export interface HomeOccasionItem {
   title: string;
   date_badge?: string | null;
   image_url?: string | null;
+  image_scale?: number | null;
+  image_position?: string | null;
   bg_color: string;
   link_type: 'header' | 'dropdown';
   target_header_id?: string | null;
@@ -121,6 +123,14 @@ function sanitizeOccasionItem(item: any): HomeOccasionItem {
     title: String(item.title || '').trim(),
     date_badge: item.date_badge && String(item.date_badge).trim() ? String(item.date_badge).trim() : null,
     image_url: item.image_url && String(item.image_url).trim() ? String(item.image_url).trim() : null,
+    image_scale:
+      item.image_scale !== undefined && item.image_scale !== null && !isNaN(Number(item.image_scale))
+        ? Number(item.image_scale)
+        : 1,
+    image_position:
+      item.image_position && String(item.image_position).trim()
+        ? String(item.image_position).trim()
+        : 'bottom-right',
     bg_color: String(item.bg_color || '#F9D3B4').trim(),
     link_type: item.link_type === 'dropdown' ? 'dropdown' : 'header',
     target_header_id: isValidUuid(item.target_header_id) ? item.target_header_id.trim() : null,
@@ -201,7 +211,12 @@ async function persistOccasionsToDb(items: HomeOccasionItem[]): Promise<void> {
     for (const item of sanitizedItems) {
       const { error } = await supabase.from('home_occasions').upsert(item, { onConflict: 'id' });
       if (error) {
-        console.warn(`[HomeOccasions] Upsert error for ${item.id}:`, error.message);
+        if (error.message?.includes('image_scale') || error.message?.includes('image_position')) {
+          const { image_scale, image_position, ...safeRow } = item;
+          await supabase.from('home_occasions').upsert(safeRow, { onConflict: 'id' });
+        } else {
+          console.warn(`[HomeOccasions] Upsert error for ${item.id}:`, error.message);
+        }
       }
     }
   } catch (err: any) {
@@ -378,6 +393,8 @@ export const createOccasion = async (req: Request, res: Response, next: NextFunc
       title: title.trim(),
       date_badge: date_badge && String(date_badge).trim() ? String(date_badge).trim() : null,
       image_url: image_url && String(image_url).trim() ? String(image_url).trim() : null,
+      image_scale: req.body?.image_scale !== undefined ? Number(req.body.image_scale) : 1,
+      image_position: req.body?.image_position || 'bottom-right',
       bg_color: bg_color || '#F9D3B4',
       link_type: link_type === 'dropdown' ? 'dropdown' : 'header',
       target_header_id: isValidUuid(target_header_id) ? target_header_id.trim() : null,
@@ -395,7 +412,12 @@ export const createOccasion = async (req: Request, res: Response, next: NextFunc
       try {
         const { error: insertErr } = await supabase.from('home_occasions').insert(newItem);
         if (insertErr) {
-          console.warn(`[HomeOccasions] Insert error for ${newItem.id}:`, insertErr.message);
+          if (insertErr.message?.includes('image_scale') || insertErr.message?.includes('image_position')) {
+            const { image_scale, image_position, ...safeRow } = newItem;
+            await supabase.from('home_occasions').insert(safeRow);
+          } else {
+            console.warn(`[HomeOccasions] Insert error for ${newItem.id}:`, insertErr.message);
+          }
         }
       } catch (err: any) {
         console.warn(`[HomeOccasions] Insert exception for ${newItem.id}:`, err?.message || err);
@@ -447,7 +469,12 @@ export const updateOccasion = async (req: Request, res: Response, next: NextFunc
       try {
         const { error: updateErr } = await supabase.from('home_occasions').update(updatedItem).eq('id', id);
         if (updateErr) {
-          console.warn(`[HomeOccasions] Supabase update error for ${id}:`, updateErr.message);
+          if (updateErr.message?.includes('image_scale') || updateErr.message?.includes('image_position')) {
+            const { image_scale, image_position, ...safeRow } = updatedItem;
+            await supabase.from('home_occasions').update(safeRow).eq('id', id);
+          } else {
+            console.warn(`[HomeOccasions] Supabase update error for ${id}:`, updateErr.message);
+          }
         }
       } catch (err: any) {
         console.warn(`[HomeOccasions] Supabase update exception for ${id}:`, err?.message || err);

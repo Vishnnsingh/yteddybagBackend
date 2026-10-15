@@ -430,7 +430,7 @@ export const cancelMyOrder = async (req: Request, res: Response, next: NextFunct
   try {
     const { id } = req.params;
     const { reason, comment, itemIndex, productId } = req.body || {};
-    const userId = (req as any).user?.userId;
+    const userId = (req as any).user?.userId || (req as any).user?.id;
 
     const supabase = getSupabaseAdmin();
     let order: OrderRecord | null = null;
@@ -443,7 +443,16 @@ export const cancelMyOrder = async (req: Request, res: Response, next: NextFunct
         query = query.eq('order_number', id);
       }
       const { data } = await query.maybeSingle();
-      if (data) order = mapDbRowToOrder(data);
+      if (data) {
+        order = mapDbRowToOrder(data);
+      } else {
+        const alt = await supabase
+          .from('orders')
+          .select('*')
+          .or(`id.eq.${id},order_number.eq.${id}`)
+          .maybeSingle();
+        if (alt.data) order = mapDbRowToOrder(alt.data);
+      }
     }
     if (!order) {
       const backup = await getStoredBackupOrders(supabase);
@@ -451,7 +460,9 @@ export const cancelMyOrder = async (req: Request, res: Response, next: NextFunct
     }
 
     if (!order) throw new AppError('Order not found', 404);
-    if (order.userId && order.userId !== userId) throw new AppError('Access denied', 403);
+    if (order.userId && userId && order.userId !== userId) {
+      throw new AppError('Access denied', 403);
+    }
 
     if (['Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'].includes(order.orderStatus)) {
       throw new AppError(`Order cannot be cancelled in '${order.orderStatus}' status`, 400);
@@ -511,6 +522,16 @@ export const cancelMyOrder = async (req: Request, res: Response, next: NextFunct
       order.notes = formattedNote;
     }
 
+    // Attempt to cancel shipment with Delhivery if waybill was already generated
+    if (order.delhiveryWaybill && order.orderStatus === 'Cancelled') {
+      try {
+        await delhiveryService.cancelShipment(order.delhiveryWaybill);
+        order.delhiveryStatus = 'Cancelled';
+      } catch (dErr: any) {
+        console.warn('[cancelMyOrder] Auto-cancel Delhivery waybill notice:', dErr?.message);
+      }
+    }
+
     if (supabase) {
       const updatePayload: any = {
         items: order.items,
@@ -520,31 +541,37 @@ export const cancelMyOrder = async (req: Request, res: Response, next: NextFunct
         cancellation_reason: order.cancellationReason || null,
         cancellation_comment: order.cancellationComment || null,
         cancelled_at: order.cancelledAt || null,
+        delhivery_status: order.delhiveryStatus || null,
       };
 
-      let updateQuery = supabase.from('orders').update(updatePayload);
+      // 1. Primary update attempting full payload
+      let updatedInDb = false;
       if (isValidUuid(order.id)) {
-        updateQuery = updateQuery.eq('id', order.id);
-      } else {
-        updateQuery = updateQuery.eq('order_number', order.orderNumber);
+        const { error } = await supabase.from('orders').update(updatePayload).eq('id', order.id);
+        if (!error) updatedInDb = true;
       }
-      const { error: updateError } = await updateQuery;
-      if (updateError) {
-        // Fallback update without new columns if schema migration hasn't been run yet
-        let fbQuery = supabase.from('orders').update({
+      if (order.orderNumber) {
+        const { error } = await supabase.from('orders').update(updatePayload).eq('order_number', order.orderNumber);
+        if (!error) updatedInDb = true;
+      }
+
+      // 2. Fallback update if migration columns (cancellation_reason etc) are missing in legacy DB
+      if (!updatedInDb) {
+        const fallbackPayload = {
           items: order.items,
           order_status: order.orderStatus,
           updated_at: now,
           notes: order.notes,
-        });
+        };
         if (isValidUuid(order.id)) {
-          fbQuery = fbQuery.eq('id', order.id);
-        } else {
-          fbQuery = fbQuery.eq('order_number', order.orderNumber);
+          await supabase.from('orders').update(fallbackPayload).eq('id', order.id);
         }
-        await fbQuery;
+        if (order.orderNumber) {
+          await supabase.from('orders').update(fallbackPayload).eq('order_number', order.orderNumber);
+        }
       }
 
+      // 3. Persist in backup json storage as well
       const backup = await getStoredBackupOrders(supabase);
       const updated = backup.map((o) => (o.id === order!.id || o.orderNumber === order!.orderNumber ? order! : o));
       await persistBackupOrders(supabase, updated);
