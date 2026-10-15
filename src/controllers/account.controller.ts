@@ -637,14 +637,4 @@ export const deleteAccount = async (req: Request, res: Response, next: NextFunct
 };
 
 // 9. Get User Orders
-export const getOrders = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const userId = req.user?.userId;
-    if (!userId) throw new AppError('Unauthorized', 401);
-
-    // Placeholder / empty orders list for plush teddy bags orders
-    return successResponse(res, 'Orders fetched successfully', []);
-  } catch (err) {
-    return next(err);
-  }
-};
+export { getMyOrders as getOrders } from './order.controller';

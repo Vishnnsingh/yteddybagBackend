@@ -10,6 +10,6 @@ router.post('/auth/create', createAdmin); // Remove or protect this in productio
 
 // Protected admin routes (requires admin role)
 router.get('/auth/profile', authenticate, authorize('admin'), getAdminProfile);
-router.post('/auth/logout', authenticate, authorize('admin'), adminLogout);
+router.post('/auth/logout', adminLogout);
 
 export default router;
